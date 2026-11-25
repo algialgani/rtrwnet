@@ -1,0 +1,417 @@
+// RT Net Panel — Prisma schema
+// Semua data transaksi punya userId (pemilik akun) agar data antar akun tidak bocor.
+// Setiap tabel yang berhubungan dengan router punya routerId.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============ AUTH & LANGGANAN ============
+
+model User {
+  id               String    @id @default(cuid())
+  name             String
+  email            String    @unique
+  passwordHash     String
+  whatsapp         String?
+  role             Role      @default(ADMIN) // ADMIN = pemilik usaha, AGENT = agen/reseller
+  emailVerifiedAt  DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  subscription     Subscription?
+  routers          Router[]
+  profiles         Profile[]
+  vouchers         Voucher[]
+  pppoeUsers       PppoeUser[]
+  customers        Customer[]
+  invoices         Invoice[]
+  agentsOwned      Agent[]     @relation("AgentOwner")
+  agentProfile     Agent?      @relation("AgentUser")
+  tickets          Ticket[]
+  ticketReplies    TicketReply[]
+  payments         Payment[]
+  settings         Settings?
+  verificationTokens VerificationToken[]
+  apiKeys          ApiKey[]
+}
+
+enum Role {
+  ADMIN
+  AGENT
+}
+
+model Subscription {
+  id        String       @id @default(cuid())
+  userId    String       @unique
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan      Plan         @default(FREE)
+  // Batas router ditegakkan di server (lihat lib/plan-limits.ts)
+  maxRouters Int         @default(1)
+  startedAt DateTime     @default(now())
+  expiresAt DateTime?
+  @@index([userId])
+}
+
+enum Plan {
+  FREE   // Rp0   — 1 router
+  BASIC  // Rp25k — 2 router
+  PRO    // Rp50k — 5 router
+}
+
+// ============ ROUTER & MONITORING ============
+
+model Router {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name         String
+  // Identitas koneksi via OpenVPN tunnel; kredensial API dienkripsi (AES-256-GCM, lib/crypto.ts)
+  vpnIp        String?   // IP tunnel OpenVPN (mis. 10.8.0.x)
+  apiPort      Int       @default(8728)
+  apiUser      String?
+  apiPassEnc   String?   // encrypted, tidak pernah plaintext
+  useRest      Boolean   @default(true) // true = RouterOS v7 REST API
+  status       RouterStatus @default(PENDING) // PENDING = menunggu script dijalankan
+  lastSeenAt   DateTime?
+  uptime       String?
+  cpuLoad      Float?
+  rosVersion   String?
+  configScript String?   // script yang harus dijalankan di terminal MikroTik
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  logs             RouterLog[]
+  trafficHistory   TrafficHistory[]
+  profiles         Profile[]
+  vouchers         Voucher[]
+  pppoeUsers       PppoeUser[]
+  dhcpLeases       DhcpLease[]
+  @@index([userId])
+  @@index([status])
+}
+
+enum RouterStatus {
+  PENDING
+  ONLINE
+  OFFLINE
+}
+
+model RouterLog {
+  id        String   @id @default(cuid())
+  routerId  String
+  router    Router   @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  message   String
+  level     LogLevel @default(INFO)
+  createdAt DateTime @default(now())
+  @@index([routerId, createdAt])
+}
+
+enum LogLevel {
+  INFO
+  WARN
+  ERROR
+}
+
+// Histori traffic per interface, diambil oleh poller agar grafik per jam/hari bisa ditampilkan
+model TrafficHistory {
+  id        String   @id @default(cuid())
+  routerId  String
+  router    Router   @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  interface String
+  rxBytes   BigInt
+  txBytes   BigInt
+  rxSpeed   Float    // bps pada saat sampling
+  txSpeed   Float
+  sampledAt DateTime @default(now())
+  @@index([routerId, interface, sampledAt])
+}
+
+model DhcpLease {
+  id        String   @id @default(cuid())
+  routerId  String
+  router    Router   @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  address   String
+  mac       String
+  hostname  String?
+  server    String?
+  status    String   @default("active")
+  updatedAt DateTime @updatedAt
+  @@index([routerId])
+}
+
+// ============ PAKET / PROFIL INTERNET ============
+
+model Profile {
+  id         String      @id @default(cuid())
+  userId     String
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  routerId   String
+  router     Router      @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  name       String
+  price      Int         @default(0) // IDR
+  downSpeed  String      // contoh "10M"
+  upSpeed    String
+  // Durasi masa aktif voucher/telah berlangganan
+  durationValue Int     @default(30)
+  durationUnit  DurationUnit @default(DAYS)
+  type       ProfileType @default(HOTSPOT)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  vouchers   Voucher[]
+  pppoeUsers PppoeUser[]
+  @@index([userId])
+  @@index([routerId])
+}
+
+enum ProfileType {
+  HOTSPOT
+  PPPOE
+}
+
+enum DurationUnit {
+  HOURS
+  DAYS
+  MONTHS
+}
+
+// ============ VOUCHER HOTSPOT ============
+
+model Voucher {
+  id         String       @id @default(cuid())
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  routerId   String
+  router     Router       @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  profileId  String
+  profile    Profile      @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  code       String       @unique
+  status     VoucherStatus @default(UNSOLD)
+  price      Int          @default(0)
+  buyerName  String?
+  soldAt     DateTime?
+  activatedAt DateTime?
+  expiresAt  DateTime?
+  // Alokasi agen
+  agentId    String?
+  agent      Agent?       @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  syncedAt   DateTime?    // null = belum tersinkron ke MikroTik (diulang job sinkron)
+  createdAt  DateTime     @default(now())
+  @@index([userId, status])
+  @@index([agentId])
+}
+
+enum VoucherStatus {
+  UNSOLD
+  SOLD
+  ACTIVE
+  EXPIRED
+}
+
+// ============ PPPoE & PELANGGAN ============
+
+model PppoeUser {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  routerId   String
+  router     Router   @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  profileId  String
+  profile    Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  username   String
+  passwordEnc String  // dienkripsi di database (diperlukan utk sync ke MikroTik)
+  status     PppoeStatus @default(ACTIVE)
+  // Isolir menunggak (opsional, dari pengaturan)
+  isolated   Boolean  @default(false)
+  syncedAt   DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  invoices   Invoice[]
+  @@unique([routerId, username])
+  @@index([userId, status])
+}
+
+enum PppoeStatus {
+  ACTIVE
+  SUSPENDED
+  EXPIRED
+}
+
+model Customer {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  phone     String   // nomor WhatsApp utk pengingat tagihan
+  address   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  pppoeUsers PppoeUser[]
+  invoices   Invoice[]   @relation("CustomerInvoices")
+  @@index([userId])
+}
+
+// ============ TAGIHAN & PEMBAYARAN ============
+
+model Invoice {
+  id          String       @id @default(cuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  customerId  String?
+  customer    Customer?    @relation("CustomerInvoices", fields: [customerId], references: [id], onDelete: SetNull)
+  pppoeUserId String?
+  pppoeUser   PppoeUser?   @relation(fields: [pppoeUserId], references: [id], onDelete: SetNull)
+  number      String       @unique // INV-YYYYMM-XXXX
+  amount      Int
+  periodStart DateTime
+  periodEnd   DateTime
+  dueDate     DateTime
+  status      InvoiceStatus @default(UNPAID)
+  paidAt      DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  payments    Payment[]
+  @@index([userId, status])
+  @@index([dueDate])
+}
+
+enum InvoiceStatus {
+  UNPAID
+  PAID
+  OVERDUE
+}
+
+model Payment {
+  id          String       @id @default(cuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  invoiceId   String
+  invoice     Invoice      @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  amount      Int
+  method      PaymentMethod @default(MANUAL)
+  gatewayRef  String?      // referensi Midtrans/Xendit (sandbox)
+  paidAt      DateTime     @default(now())
+  @@index([invoiceId])
+}
+
+enum PaymentMethod {
+  MANUAL
+  MIDTRANS
+  XENDIT
+}
+
+// ============ AGEN / RESELLER ============
+
+model Agent {
+  id         String   @id @default(cuid())
+  ownerId    String   // pemilik akun (admin) yang membuat agen ini
+  owner      User     @relation("AgentOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  // Akun login agen (opsional — agen bisa dibuat dulu tanpa akun)
+  userId     String?  @unique
+  user       User?    @relation("AgentUser", fields: [userId], references: [id], onDelete: SetNull)
+  name       String
+  phone      String?
+  commissionPct Int   @default(0)
+  balance    Int      @default(0) // saldo/komisi IDR
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  vouchers   Voucher[]
+  @@index([ownerId])
+}
+
+// ============ TIKET BANTUAN ============
+
+model Ticket {
+  id        String      @id @default(cuid())
+  number    String      @unique // IN + YY + 6 digit urut (IN25000001)
+  userId    String      // pembuat tiket (pelanggan/agen/pemilik)
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject   String
+  status    TicketStatus @default(OPEN)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  replies   TicketReply[]
+  @@index([userId, status])
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  CLOSED
+}
+
+model TicketReply {
+  id        String   @id @default(cuid())
+  ticketId  String
+  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  message   String
+  createdAt DateTime @default(now())
+  @@index([ticketId, createdAt])
+}
+
+// ============ PENGATURAN & TOKEN ============
+
+model Settings {
+  id             String  @id @default(cuid())
+  userId         String  @unique
+  user           User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessName   String?
+  businessPhone  String?
+  businessAddress String?
+  // WhatsApp gateway (Fonnte/Wablas) — API key disimpan terenkripsi
+  waProvider     String?  // "fonnte" | "wablas"
+  waApiKeyEnc    String?
+  waEnabled      Boolean @default(false)
+  // Payment gateway (mode sandbox)
+  pgProvider     String?  // "midtrans" | "xendit"
+  pgApiKeyEnc    String?
+  pgSandbox      Boolean @default(true)
+  // Isolir otomatis menunggak
+  autoIsolate    Boolean @default(false)
+  // Kunci API untuk integrasi eksternal
+  updatedAt      DateTime @updatedAt
+}
+
+model VerificationToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique // SHA-256 dari token, token asli hanya via email
+  type      TokenType
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+  @@index([userId, type])
+}
+
+enum TokenType {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+}
+
+model ApiKey {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  keyHash   String   @unique
+  lastUsedAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([userId])
+}
