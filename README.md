@@ -44,6 +44,8 @@ Ganti paket di Pengaturan — batas router di server berubah langsung.
 
 ## Cara Install
 
+> 📘 Panduan deploy lengkap (VPS + lokal + troubleshooting): lihat **[DEPLOY.md](./DEPLOY.md)**.
+
 ```bash
 # 1. Dependensi
 npm install
